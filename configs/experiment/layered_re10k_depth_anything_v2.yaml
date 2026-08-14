@@ -1,0 +1,24 @@
+# @package _global_
+config:
+  exp_name: layered_re10k_depth_anything_v2
+
+defaults:
+  - override /dataset: re10k
+  - override /model: gaussian
+  - override /model/depth: depth_anything_v2
+  - override /loss: [regularization, reconstruction]
+
+model:
+  name: depth_anything_v2
+  gauss_novel_frames: [-1, 1, 2]
+  renderer_w_pose: true
+  scale_with_depth: false
+  opacity_scale: 1.0
+  depth_scale: 0.1
+  xyz_scale: 0.2
+  max_depth: 20
+  depth_cond: true
+
+train:
+  scale_pose_by_depth: true
+  use_gt_poses: true

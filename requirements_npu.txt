@@ -1,0 +1,58 @@
+# Flash3D training dependencies for Huawei Ascend 910B on Linux.
+#
+# Target framework profile (official Ascend compatibility matrix):
+#   CANN 9.0.0 + Python 3.10/3.11 + PyTorch 2.7.1 + torch_npu 2.7.1.post4
+#
+# Prerequisites NOT installable by pip:
+#   1. Install the Ascend 910B driver, firmware and CANN toolkit 9.0.0.
+#   2. In every shell, initialise CANN, for example:
+#        source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#      (the installed CANN path may differ).
+#   3. Install the torch_npu wheel matching BOTH your CANN version and CPU
+#      architecture (x86_64/aarch64) from the official Ascend release site.
+#
+# Do not install requirements.txt together with this file: it contains CUDA
+# extensions (xformers and diff-gaussian-rasterization) that cannot run on NPU.
+
+# PyTorch core.  Use the official Ascend wheel source for torch_npu if your
+# mirror does not expose this package directly.
+torch==2.7.1
+torchvision==0.22.1
+torch_npu==2.7.1.post4
+
+# Flash3D training, data loading, logging, and evaluation.
+numpy==1.26.4
+Pillow>=10.0
+einops
+omegaconf
+hydra-core
+hydra-submitit-launcher
+submitit
+lightning
+ema-pytorch
+torchmetrics
+timm
+jaxtyping
+scipy
+scikit-image
+opencv-python-headless
+matplotlib
+pandas
+psutil
+plyfile
+safetensors
+huggingface-hub>=0.22.0
+imageio
+tqdm
+PyYAML
+ninja
+GitPython
+pytubefix
+
+# Optional experiment tracking; uncomment one only if it is used.
+# wandb
+# neptune
+
+# Explicitly excluded: xformers, triton, diff-gaussian-rasterization.
+# Flash3D's CUDA rasterizer must be replaced by an Ascend-native differentiable
+# Gaussian rasterizer before NPU training with photometric render loss is run.

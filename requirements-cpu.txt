@@ -1,0 +1,35 @@
+# CPU-only environment for Flash3D inference, Gaussian alpha rendering, and
+# PSNR/SSIM/LPIPS evaluation on Windows/Linux.  It deliberately excludes CUDA,
+# Triton, xFormers and diff-gaussian-rasterization.
+#
+# Install with:
+#   python -m pip install -r requirements-cpu.txt
+#
+# The extra index makes pip select official CPU PyTorch wheels where available.
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy==1.26.4
+torch>=2.2,<2.6
+torchvision>=0.17,<0.21
+Pillow>=10.0
+einops
+huggingface-hub>=0.22.0
+imageio
+matplotlib
+opencv-python
+pandas
+psutil
+safetensors
+scipy
+timm
+tqdm
+scikit-image
+plyfile
+torchmetrics
+omegaconf
+hydra-core
+jaxtyping
+
+# Optional Depth Anything V2 adapter source and its checkpoint are intentionally
+# local files, rather than pip dependencies.  See:
+#   third_party/Depth-Anything-V2/
+#   weights/depth-anything-v2/

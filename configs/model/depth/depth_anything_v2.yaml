@@ -1,0 +1,17 @@
+# Depth Anything V2 Base is the NPU pre-training default.  It is materially
+# smaller than UniDepth V1 ViT-L while retaining better geometry than ViT-S.
+# Use a metric checkpoint where possible: Flash3D's Gaussian geometry benefits
+# from a stable depth scale.  ``source_dir`` is intentionally local/offline.
+name: depth_anything_v2
+encoder: vitb
+source_dir: third_party/Depth-Anything-V2
+checkpoint: weights/depth-anything-v2/depth_anything_v2_metric_vkitti_vitb.pth
+input_size: 518
+min_depth: 1.0e-4
+depth_normalizer: 20.0
+freeze: true
+finetune_lr: 1.0e-5
+# ``provided`` uses K_src from RE10K/KITTI datasets.  ``learned`` activates the
+# small camera head for datasets/inference without calibrated intrinsics.
+intrinsics_source: provided
+initial_focal_ratio: 0.9
