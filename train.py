@@ -12,7 +12,6 @@ from pytorch_lightning import seed_everything
 from lightning.fabric import Fabric
 from lightning.fabric.strategies import DDPStrategy
 
-from misc.logger import setup_logger
 from evaluation.evaluator import Evaluator
 from datasets.util import create_datasets
 from trainer import Trainer
@@ -103,10 +102,14 @@ def main(cfg: DictConfig):
                 "NPU training requires torch_npu. Install the wheel matched to CANN."
             ) from error
     # set up training precision
+    # A single-device CPU smoke test should not initialise DDP.  Keeping DDP
+    # for multi-device runs preserves the original distributed training path.
+    devices = cfg.train.num_gpus
+    strategy = DDPStrategy(find_unused_parameters=True) if devices > 1 else "auto"
     fabric = Fabric(
         accelerator=accelerator,
-        devices=cfg.train.num_gpus,
-        strategy=DDPStrategy(find_unused_parameters=True),
+        devices=devices,
+        strategy=strategy,
         precision=cfg.train.mixed_precision
     )
     fabric.launch()
@@ -148,6 +151,10 @@ def main(cfg: DictConfig):
     train_loader = fabric.setup_dataloaders(train_loader)
     if fabric.is_global_zero:
         if cfg.train.logging:
+            # Neptune credentials are optional for local/CPU smoke tests.  Keep
+            # the import lazy so a checkout without the private token module
+            # can still train with ``train.logging=false``.
+            from misc.logger import setup_logger
             trainer.set_logger(setup_logger(cfg))
         val_dataset, val_loader = create_datasets(cfg, split="val")
         evaluator = Evaluator()

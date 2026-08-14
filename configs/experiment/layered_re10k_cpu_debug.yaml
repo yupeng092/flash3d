@@ -1,0 +1,63 @@
+# One-step/small-run CPU training profile for validating the Depth Anything V2
+# integration.  This is deliberately not a throughput profile: the pure
+# PyTorch Gaussian renderer is differentiable but substantially slower than the
+# CUDA rasterizer.
+#
+# Usage:
+#   python train.py +experiment=layered_re10k_cpu_debug
+#
+# Set ``dataset.data_path`` to a local RE10K root if it differs from the base
+# configuration.  Use ``dataset.subset`` to cap the number of sequences during
+# debugging.
+
+defaults:
+  - override /dataset: re10k
+  - override /model: gaussian
+  - override /model/depth: depth_anything_v2
+  - override /loss: [regularization, reconstruction]
+
+config:
+  exp_name: layered_re10k_cpu_debug
+
+data_loader:
+  batch_size: 1
+  # Windows CPU debugging is more reliable without worker subprocesses.
+  num_workers: 0
+
+train:
+  accelerator: cpu
+  num_gpus: 1
+  mixed_precision: 32-true
+  # Avoid the optional Neptune logger and its private credential module.
+  logging: false
+  ema:
+    use: false
+
+run:
+  log_frequency: 1
+  save_frequency: 1000000
+  val_frequency: 1000000
+
+model:
+  name: depth_anything_v2
+  # The portable torch renderer is the CPU/NPU differentiable implementation.
+  renderer_backend: torch
+  renderer_w_pose: true
+  gauss_novel_frames: [1]
+  npu_renderer_tile_size: 16
+  npu_renderer_tile_span: 3
+  npu_renderer_max_radius: 24.0
+  # Small cap makes the first backward pass practical on a CPU; raise after
+  # validating loss/backpropagation.
+  npu_renderer_max_gaussians_per_tile: 64
+  npu_renderer_max_gaussians: 4096
+  npu_renderer_sigma_cutoff: 3.0
+  npu_renderer_min_variance: 0.30
+
+dataset:
+  # Must remain multiples of 32 for the Flash3D ResNet decoder.
+  height: 128
+  width: 192
+  pad_border_aug: 0
+  color_aug: false
+  subset: 2

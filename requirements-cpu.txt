@@ -29,6 +29,10 @@ omegaconf
 hydra-core
 jaxtyping
 
+# Needed by the training smoke-test entry point (``train.py``).
+lightning
+ema-pytorch
+
 # Optional Depth Anything V2 adapter source and its checkpoint are intentionally
 # local files, rather than pip dependencies.  See:
 #   third_party/Depth-Anything-V2/
