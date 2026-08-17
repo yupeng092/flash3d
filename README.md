@@ -51,6 +51,10 @@ pip install -r requirements-torch.txt --extra-index-url https://download.pytorch
 pip install -r requirements.txt
 ```
 
+For the local UniDepth V1 source/weight layout used by this repository (including an offline CPU fallback), see [docs/UNIDEPTH_SETUP.md](docs/UNIDEPTH_SETUP.md).
+
+For CPU rendering from exported `gaussians.pt`, use `render_cpu_multiview.py`.  It renders named multi-camera rigs (the default is centre/left/right/up/down) and writes the exact rig to `camera_rig.json`.
+
 ## Download training data
 
 ### RealEstate10K dataset
@@ -115,7 +119,5 @@ You can modify the cluster information in ```configs/hydra/cluster```.
       year = {2024},
 }
 ```
-
-
 
 
