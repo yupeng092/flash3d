@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Single-card Ascend 910B Flash3D pre-training launcher.
+# Single-card Ascend 910B pre-training: frozen Depth Anything V2 Base +
+# trainable Flash3D Gaussian heads. Extra Hydra overrides are forwarded.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

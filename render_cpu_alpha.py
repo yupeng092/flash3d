@@ -24,9 +24,37 @@ import psutil
 import torch
 import torch.nn.functional as F
 from PIL import Image
+import numpy as np
 
 
 SH_C0 = 0.28209479177387814
+SH_C1 = 0.4886025119029199
+SH_C2 = (
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396,
+)
+SH_C3 = (
+    -0.5900435899266435,
+    2.890611442640554,
+    -0.4570457994644658,
+    0.3731763325901154,
+    -0.4570457994644658,
+    1.445305721320277,
+    -0.5900435899266435,
+)
+
+
+def linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
+    """Encode a linear-RGB image for ordinary sRGB PNG display."""
+    image = image.clamp(0.0, 1.0)
+    return torch.where(
+        image <= 0.0031308,
+        image * 12.92,
+        1.055 * image.pow(1.0 / 2.4) - 0.055,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sharpen", type=float, default=0.0,
         help="Unsharp-mask amount applied after rendering (0 disables it)",
+    )
+    parser.add_argument(
+        "--linear-to-srgb", action=argparse.BooleanOptionalAction, default=False,
+        help="Encode rendered linear RGB to sRGB before PNG output; useful for UniSHARP exports",
     )
     parser.add_argument(
         "--crop-margin", type=int, default=0,
@@ -113,20 +145,177 @@ def make_small_baseline_trajectory(views: int, translation: float, yaw_deg: floa
     return torch.stack(transforms)
 
 
+def _read_binary_ply_vertices(path: Path) -> dict[str, torch.Tensor]:
+    """Read the vertex element of a binary-little-endian 3DGS PLY without extra dependencies."""
+    ply_types = {
+        "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+        "uchar": "u1", "uint8": "u1", "int": "<i4", "int32": "<i4",
+        "uint": "<u4", "uint32": "<u4",
+    }
+    with path.open("rb") as file:
+        header_lines = []
+        while True:
+            line = file.readline()
+            if not line:
+                raise ValueError(f"Invalid PLY header: {path}")
+            decoded = line.decode("ascii").strip()
+            header_lines.append(decoded)
+            if decoded == "end_header":
+                break
+        if "format binary_little_endian 1.0" not in header_lines:
+            raise ValueError(f"Only binary_little_endian 3DGS PLY is supported: {path}")
+        vertex_count = None
+        fields: list[tuple[str, str]] = []
+        in_vertex = False
+        for line in header_lines:
+            parts = line.split()
+            if parts[:2] == ["element", "vertex"]:
+                vertex_count = int(parts[2])
+                in_vertex = True
+            elif parts and parts[0] == "element" and in_vertex:
+                in_vertex = False
+            elif in_vertex and parts and parts[0] == "property":
+                if len(parts) != 3 or parts[1] not in ply_types:
+                    raise ValueError(f"Unsupported PLY vertex property: {line}")
+                fields.append((parts[2], ply_types[parts[1]]))
+        if vertex_count is None or not fields:
+            raise ValueError(f"PLY has no vertex element: {path}")
+        vertices = np.fromfile(file, dtype=np.dtype(fields), count=vertex_count)
+    return {name: torch.from_numpy(vertices[name].copy()).float() for name, _ in fields}
+
+
+def _load_standard_3dgs_ply(path: Path) -> tuple[dict[str, torch.Tensor], dict]:
+    fields = _read_binary_ply_vertices(path)
+    required = {"x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"}
+    missing = required.difference(fields)
+    if missing:
+        raise KeyError(f"PLY lacks required 3DGS fields: {sorted(missing)}")
+    if {"f_dc_0", "f_dc_1", "f_dc_2"}.issubset(fields):
+        features_dc = torch.stack((fields["f_dc_0"], fields["f_dc_1"], fields["f_dc_2"]), dim=-1)
+    elif {"red", "green", "blue"}.issubset(fields):
+        rgb = torch.stack((fields["red"], fields["green"], fields["blue"]), dim=-1) / 255.0
+        features_dc = (rgb - 0.5) / SH_C0
+    else:
+        raise KeyError("PLY requires f_dc_0..2 or red/green/blue colour fields")
+    opacity = fields["opacity"]
+    # Official 3DGS PLY stores opacity and scaling before activation.
+    if opacity.min() < 0 or opacity.max() > 1:
+        opacity = opacity.sigmoid()
+    scaling = torch.stack((fields["scale_0"], fields["scale_1"], fields["scale_2"]), dim=-1)
+    if scaling.min() <= 0:
+        scaling = scaling.exp()
+    raw = {
+        "xyz": torch.stack((fields["x"], fields["y"], fields["z"]), dim=-1),
+        "opacity": opacity,
+        "scaling": scaling,
+        "rotation": torch.stack((fields["rot_0"], fields["rot_1"], fields["rot_2"], fields["rot_3"]), dim=-1),
+        "features_dc": features_dc,
+    }
+    rest_names = sorted(
+        (name for name in fields if name.startswith("f_rest_")),
+        key=lambda name: int(name.removeprefix("f_rest_")),
+    )
+    if rest_names:
+        if len(rest_names) % 3:
+            raise ValueError(f"Invalid f_rest field count ({len(rest_names)}) in {path}")
+        # 3DGS serialises coefficients in coefficient-major, RGB-minor order.
+        raw["features_rest"] = torch.stack([fields[name] for name in rest_names], dim=-1).reshape(-1, len(rest_names) // 3, 3)
+    return raw, {"source_format": "standard_3dgs_ply"}
+
+
+def _load_unisharp_gaussians(path: Path) -> tuple[dict[str, torch.Tensor], dict]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("format") != "unisharp_gaussians":
+        raise ValueError(f"Not a UniSHARP Gaussian export: {path}")
+    gaussians = payload["gaussians"]
+    colours = gaussians["colors"].reshape(-1, 3).float()
+    raw = {
+        "xyz": gaussians["mean_vectors"].reshape(-1, 3).float(),
+        "opacity": gaussians["opacities"].reshape(-1).float(),
+        "scaling": gaussians["singular_values"].reshape(-1, 3).float(),
+        "rotation": gaussians["quaternions"].reshape(-1, 4).float(),
+        "features_dc": (colours - 0.5) / SH_C0,
+    }
+    image = payload.get("image", {})
+    return raw, {
+        "source_format": "unisharp_gaussians",
+        "input_size_hw": (image.get("height", 0), image.get("width", 0)),
+        "camera": payload.get("camera", {}),
+    }
+
+
+def _load_sharp_gaussians(path: Path, payload: dict) -> tuple[dict[str, torch.Tensor], dict]:
+    """Load SHARP's compact PT export (one Gaussian tensor per image pixel)."""
+    colours = payload["colors"].reshape(-1, 3).float()
+    image_shape = tuple(int(value) for value in payload.get("image_shape", (0, 0)))
+    if len(image_shape) != 2:
+        image_shape = (0, 0)
+    height, width = image_shape
+    focal = float(payload.get("f_px", 0.0))
+    raw = {
+        "xyz": payload["mean_vectors"].reshape(-1, 3).float(),
+        "opacity": payload["opacities"].reshape(-1).float(),
+        "scaling": payload["singular_values"].reshape(-1, 3).float(),
+        "rotation": payload["quaternions"].reshape(-1, 4).float(),
+        "features_dc": (colours - 0.5) / SH_C0,
+    }
+    return raw, {
+        "source_format": "sharp_gaussians",
+        "input_size_hw": image_shape,
+        "camera": {
+            "intrinsics": [focal, focal, (width - 1) * 0.5, (height - 1) * 0.5]
+        } if focal > 0 and height > 0 and width > 0 else {},
+        "source": str(payload.get("source", "")),
+    }
+
+
 def load_gaussians(
     path: Path, keep_ratio: float, min_opacity: float, crop_padding: bool
 ) -> tuple[dict[str, torch.Tensor], dict]:
-    payload = torch.load(path, map_location="cpu", weights_only=True)
-    raw = payload["gaussians"] if "gaussians" in payload else payload
-    metadata = payload.get("metadata", {})
+    if path.suffix.lower() == ".ply":
+        raw, metadata = _load_standard_3dgs_ply(path)
+    else:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(payload, dict) and payload.get("format") == "unisharp_gaussians":
+            raw, metadata = _load_unisharp_gaussians(path)
+        elif isinstance(payload, dict) and {"mean_vectors", "singular_values", "quaternions", "colors", "opacities"}.issubset(payload):
+            raw, metadata = _load_sharp_gaussians(path, payload)
+        else:
+            raw = payload["gaussians"] if "gaussians" in payload else payload
+            metadata = payload.get("metadata", {})
+    # Render dumps produced by render_cpu_multiview.py keep a ready-to-use
+    # colour rather than the original DC coefficients.  Accepting them makes
+    # those dumps useful as CPU-renderable Flash3D test inputs as well.
+    if "features_dc" not in raw and "color" in raw:
+        raw = dict(raw)
+        raw["features_dc"] = (raw["color"].detach().float() - 0.5) / SH_C0
     required = {"xyz", "opacity", "scaling", "rotation", "features_dc"}
     missing = required.difference(raw)
     if missing:
         raise KeyError(f"Missing Gaussian fields: {sorted(missing)}")
 
     gaussians = {key: raw[key].detach().float().cpu() for key in required}
+    if "features_rest" in raw:
+        features_rest = raw["features_rest"].detach().float().cpu()
+        # Flash3D writes [N, 3 * number_of_SH_coefficients], while standard
+        # 3DGS PLY loading already yields [N, number_of_coefficients, 3].
+        # Canonicalise both forms before view-dependent SH evaluation.
+        if features_rest.ndim == 2:
+            if features_rest.shape[1] % 3:
+                raise ValueError("features_rest channel count must be divisible by RGB channels")
+            features_rest = features_rest.reshape(features_rest.shape[0], -1, 3)
+        elif features_rest.ndim != 3 or features_rest.shape[-1] != 3:
+            raise ValueError("features_rest must have shape [N, coefficients, 3]")
+        gaussians["features_rest"] = features_rest
     gaussians["opacity"] = gaussians["opacity"].reshape(-1).clamp(0.0, 1.0)
-    gaussians["color"] = (0.5 + SH_C0 * gaussians.pop("features_dc")).clamp(0.0, 1.0)
+    # Keep the DC coefficients as well as the convenient RGB view.  The
+    # PyTorch renderer uses ``color``; Flash3D's native CUDA rasterizer needs
+    # ``features_dc`` (and optionally ``features_rest``) to evaluate SH in
+    # exactly the same way as the original model code.
+    gaussians["color"] = (0.5 + SH_C0 * gaussians["features_dc"]).clamp(0.0, 1.0)
 
     valid = (
         torch.isfinite(gaussians["xyz"]).all(dim=-1)
@@ -154,6 +343,53 @@ def load_gaussians(
     return ({key: value[valid].contiguous() for key, value in gaussians.items()}, metadata)
 
 
+def evaluate_view_dependent_color(
+    gaussians: dict[str, torch.Tensor], camera_center: torch.Tensor
+) -> torch.Tensor:
+    """Evaluate 3DGS real SH colours for one camera centre.
+
+    Flash3D and UniSHARP exports provide only RGB/DC colour and therefore
+    correctly fall back to a fixed colour.  Standard 3DGS PLY exports often
+    include ``f_rest``; evaluating it here prevents a view-dependent material
+    from being rendered as a fixed, incorrect texture during camera motion.
+    """
+    coefficients = gaussians.get("features_rest")
+    if coefficients is None or coefficients.numel() == 0:
+        return gaussians["color"]
+    directions = torch.nn.functional.normalize(
+        gaussians["xyz"] - camera_center[None], dim=-1, eps=1e-8)
+    x, y, z = directions.unbind(dim=-1)
+    result = SH_C0 * ((gaussians["color"] - 0.5) / SH_C0)
+    degree = min(3, int(math.sqrt(coefficients.shape[1] + 1)) - 1)
+    if degree >= 1:
+        result = result + (
+            -SH_C1 * y[:, None] * coefficients[:, 0]
+            + SH_C1 * z[:, None] * coefficients[:, 1]
+            - SH_C1 * x[:, None] * coefficients[:, 2]
+        )
+    if degree >= 2:
+        xx, yy, zz = x.square(), y.square(), z.square()
+        xy, yz, xz = x * y, y * z, x * z
+        result = result + (
+            SH_C2[0] * xy[:, None] * coefficients[:, 3]
+            + SH_C2[1] * yz[:, None] * coefficients[:, 4]
+            + SH_C2[2] * (2.0 * zz - xx - yy)[:, None] * coefficients[:, 5]
+            + SH_C2[3] * xz[:, None] * coefficients[:, 6]
+            + SH_C2[4] * (xx - yy)[:, None] * coefficients[:, 7]
+        )
+    if degree >= 3:
+        result = result + (
+            SH_C3[0] * (y * (3.0 * xx - yy))[:, None] * coefficients[:, 8]
+            + SH_C3[1] * (x * y * z)[:, None] * coefficients[:, 9]
+            + SH_C3[2] * (y * (4.0 * zz - xx - yy))[:, None] * coefficients[:, 10]
+            + SH_C3[3] * (z * (2.0 * zz - 3.0 * xx - 3.0 * yy))[:, None] * coefficients[:, 11]
+            + SH_C3[4] * (x * (4.0 * zz - xx - yy))[:, None] * coefficients[:, 12]
+            + SH_C3[5] * (z * (xx - yy))[:, None] * coefficients[:, 13]
+            + SH_C3[6] * (x * (xx - 3.0 * yy))[:, None] * coefficients[:, 14]
+        )
+    return (result + 0.5).clamp(0.0, 1.0)
+
+
 def project_gaussians(
     gaussians: dict[str, torch.Tensor],
     world_to_camera: torch.Tensor,
@@ -169,6 +405,7 @@ def project_gaussians(
     scale_modifier: float,
     width: int,
     height: int,
+    camera_center: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     xyz = gaussians["xyz"]
     camera_rotation = world_to_camera[:3, :3].float()
@@ -214,6 +451,7 @@ def project_gaussians(
         & (v - radius < height)
     )
     order = torch.argsort(z[visible])
+    colours = gaussians["color"] if camera_center is None else evaluate_view_dependent_color(gaussians, camera_center)
     return {
         "u": u[visible][order],
         "v": v[visible][order],
@@ -221,7 +459,7 @@ def project_gaussians(
         "radius": radius[visible][order],
         "inverse": inverse[visible][order],
         "opacity": gaussians["opacity"][visible][order],
-        "color": gaussians["color"][visible][order],
+        "color": colours[visible][order],
     }
 
 
@@ -434,6 +672,8 @@ def main() -> None:
         alpha = crop_and_downsample(alpha, args.height, args.width, args.supersample, args.crop_margin).clamp(0, 1)
         depth = crop_and_downsample(depth, args.height, args.width, args.supersample, args.crop_margin)
         rgb = unsharp_mask(rgb, args.sharpen)
+        if args.linear_to_srgb:
+            rgb = linear_to_srgb(rgb)
         save_rgb(rgb, rgb_dir / f"{stem}.png")
         save_gray(alpha, alpha_dir / f"{stem}.png")
         save_gray(normalise_depth(depth, alpha), depth_dir / f"{stem}.png")
@@ -470,6 +710,7 @@ def main() -> None:
             "supersample": args.supersample,
             "crop_margin": args.crop_margin,
             "sharpen": args.sharpen,
+            "linear_to_srgb": args.linear_to_srgb,
         },
     }
     with (args.output / "render_report.json").open("w", encoding="utf-8") as file:

@@ -36,13 +36,35 @@ from models.model import GaussianPredictor
 from misc.visualise_3d import save_ply
 
 
-def make_input(image_path: Path, height: int, width: int, pad: int, device: torch.device) -> dict:
-    """Match Flash3D's RE10K loader: RGB [0,1], resize, then zero padding."""
+def make_input(
+    image_path: Path,
+    height: int,
+    width: int,
+    pad: int,
+    device: torch.device,
+    intrinsics: tuple[float, float, float, float] | None = None,
+) -> dict:
+    """Match Flash3D's RE10K loader: resize RGB and update a calibrated K.
+
+    ``intrinsics`` are [fx, fy, cx, cy] in pixels of the *original* input
+    image.  RE10K supplies this information per frame; for an uncalibrated
+    photograph it can be omitted and UniDepth will infer the camera matrix.
+    """
     image = Image.open(image_path).convert("RGB")
+    original_width, original_height = image.size
     image = TVF.resize(image, [height, width], interpolation=InterpolationMode.LANCZOS)
     color = TVF.to_tensor(image).unsqueeze(0).to(device)
     color_aug = F.pad(color, (pad, pad, pad, pad)) if pad else color
-    return {("color", 0, 0): color, ("color_aug", 0, 0): color_aug}
+    inputs = {("color", 0, 0): color, ("color_aug", 0, 0): color_aug}
+    if intrinsics is not None:
+        fx, fy, cx, cy = intrinsics
+        matrix = torch.eye(3, dtype=torch.float32, device=device)
+        matrix[0, 0] = fx * width / original_width
+        matrix[1, 1] = fy * height / original_height
+        matrix[0, 2] = cx * width / original_width + pad
+        matrix[1, 2] = cy * height / original_height + pad
+        inputs[("K_src", 0)] = matrix.unsqueeze(0)
+    return inputs
 
 
 def percentile_clip(values: torch.Tensor, quantile: float) -> torch.Tensor:
@@ -127,8 +149,14 @@ def make_trajectory(views: int, translation: float, yaw_deg: float, device: torc
     return transforms
 
 
-def render_reference(gaussians: dict, transform: torch.Tensor, height: int, width: int, focal_px: float,
-                     background: float = 0.5) -> torch.Tensor:
+def render_reference(
+    gaussians: dict,
+    transform: torch.Tensor,
+    height: int,
+    width: int,
+    intrinsics: torch.Tensor,
+    background: float = 0.5,
+) -> torch.Tensor:
     """Low-memory CPU reference renderer using depth-sorted bilinear splats.
 
     It deliberately uses a one-pixel footprint. This makes it appropriate for
@@ -143,8 +171,9 @@ def render_reference(gaussians: dict, transform: torch.Tensor, height: int, widt
     points, z = points[valid], z[valid]
     opacity = gaussians["opacity"][valid]
     color = gaussians["color"][valid]
-    u = focal_px * points[:, 0] / z + (width - 1) * 0.5
-    v = focal_px * points[:, 1] / z + (height - 1) * 0.5
+    fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
+    u = fx * points[:, 0] / z + cx
+    v = fy * points[:, 1] / z + cy
     x0, y0 = torch.floor(u).long(), torch.floor(v).long()
     base_weight = opacity / torch.clamp(z, min=1e-3)
     accum_rgb = torch.zeros((3, height * width), dtype=torch.float32)
@@ -187,6 +216,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yaw", type=float, default=8.0, help="Maximum yaw in degrees")
     parser.add_argument("--keep-ratio", type=float, default=0.35, help="Keep the highest-opacity fraction (0, 1]")
     parser.add_argument("--focal-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--intrinsics", type=float, nargs=4, metavar=("FX", "FY", "CX", "CY"), default=None,
+        help="Optional calibrated source-camera values in pixels of the original input image; RE10K supplies these per frame",
+    )
     return parser.parse_args()
 
 
@@ -220,7 +253,11 @@ def main() -> None:
     model = GaussianPredictor(cfg).to(device)
     model.load_model(args.checkpoint, device="cpu")
     model.set_eval()
-    inputs = make_input(args.image, cfg.dataset.height, cfg.dataset.width, cfg.dataset.pad_border_aug, device)
+    user_intrinsics = None if args.intrinsics is None else tuple(args.intrinsics)
+    inputs = make_input(
+        args.image, cfg.dataset.height, cfg.dataset.width, cfg.dataset.pad_border_aug,
+        device, user_intrinsics,
+    )
     process = psutil.Process(os.getpid())
     with torch.inference_mode():
         for _ in range(args.warmup):
@@ -237,7 +274,18 @@ def main() -> None:
         tracemalloc.stop()
         rss_after = process.memory_info().rss
         gaussians = collect_gaussians(outputs, cfg.model.gaussians_per_pixel, args.keep_ratio)
-        focal = args.focal_scale * 0.5 * (args.render_width + args.render_height)
+        source_intrinsics = outputs[("K_src", 0)][0].detach().cpu().float()
+        # Gaussian predictions use the padded source image.  Novel-view output
+        # is rendered at the unpadded size, so undo only the principal-point
+        # offset introduced by the border.
+        render_intrinsics = source_intrinsics.clone()
+        render_intrinsics[0, 2] -= cfg.dataset.pad_border_aug
+        render_intrinsics[1, 2] -= cfg.dataset.pad_border_aug
+        render_intrinsics[0, :] *= args.render_width / cfg.dataset.width
+        render_intrinsics[1, :] *= args.render_height / cfg.dataset.height
+        if args.focal_scale != 1.0:
+            render_intrinsics[0, 0] *= args.focal_scale
+            render_intrinsics[1, 1] *= args.focal_scale
         trajectory = make_trajectory(args.views, args.translation, args.yaw, device)
         point_cloud_metadata = {
             "format_version": 1,
@@ -251,6 +299,9 @@ def main() -> None:
             "gaussians_per_pixel": int(cfg.model.gaussians_per_pixel),
             "max_sh_degree": int(cfg.model.max_sh_degree),
             "checkpoint": str(args.checkpoint.resolve()),
+            "camera": {"intrinsics": render_intrinsics.tolist()},
+            "source_intrinsics_padded": source_intrinsics.tolist(),
+            "intrinsics_mode": "provided" if user_intrinsics is not None else "unidepth_predicted",
         }
         save_gaussian_data(outputs, args.output, cfg.model.gaussians_per_pixel, point_cloud_metadata)
         torch.save(torch.stack(trajectory).cpu(), args.output / "render_poses.pt")
@@ -259,7 +310,7 @@ def main() -> None:
         render_times = []
         for index, transform in enumerate(trajectory):
             start = time.perf_counter()
-            frame = render_reference(gaussians, transform, args.render_height, args.render_width, focal)
+            frame = render_reference(gaussians, transform, args.render_height, args.render_width, render_intrinsics)
             render_times.append(time.perf_counter() - start)
             save_image(frame, args.output / "views" / f"view_{index:03d}.png")
 
@@ -272,6 +323,8 @@ def main() -> None:
         "checkpoint": str(args.checkpoint.resolve()),
         "input_size": [cfg.dataset.height, cfg.dataset.width],
         "render_size": [args.render_height, args.render_width],
+        "intrinsics_at_render_size": render_intrinsics.tolist(),
+        "intrinsics_mode": "provided" if user_intrinsics is not None else "unidepth_predicted",
         "inference_seconds": {"runs": times, "mean": float(np.mean(times)), "p50": float(np.median(times))},
         "render_seconds": {"views": render_times, "mean": float(np.mean(render_times)), "total": float(np.sum(render_times))},
         "gaussians": {"raw": int(outputs["gauss_means"].shape[0] * outputs["gauss_means"].shape[-1]), "kept": int(gaussians["xyz"].shape[0]), "keep_ratio": args.keep_ratio},

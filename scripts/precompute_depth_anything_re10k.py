@@ -38,6 +38,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=384)
     parser.add_argument("--input-size", type=int, default=518)
+    parser.add_argument("--max-depth", type=float, default=80.0, help="Metric checkpoint maximum depth; 80 for VKITTI, 20 for Hypersim")
     parser.add_argument("--device", choices=("auto", "npu", "cuda", "cpu"), default="auto")
     parser.add_argument("--splits", nargs="+", choices=("train", "test"), default=("train", "test"))
     parser.add_argument("--limit", type=int, default=0, help="Maximum total images; 0 means all")
@@ -62,7 +63,8 @@ def select_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(source_dir: Path, checkpoint: Path, encoder: str, device: torch.device) -> torch.nn.Module:
+def load_model(source_dir: Path, checkpoint: Path, encoder: str, max_depth: float, device: torch.device) -> torch.nn.Module:
+    source_dir = source_dir / "metric_depth"
     module_file = source_dir / "depth_anything_v2" / "dpt.py"
     if not module_file.is_file():
         raise FileNotFoundError(f"Missing Depth Anything V2 source: {module_file}")
@@ -73,7 +75,7 @@ def load_model(source_dir: Path, checkpoint: Path, encoder: str, device: torch.d
         from depth_anything_v2.dpt import DepthAnythingV2
     finally:
         sys.path.pop(0)
-    model = DepthAnythingV2(encoder=encoder, **DEPTH_ANYTHING_CONFIGS[encoder])
+    model = DepthAnythingV2(encoder=encoder, **DEPTH_ANYTHING_CONFIGS[encoder], max_depth=max_depth)
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model.load_state_dict(state.get("model", state), strict=True)
     return model.to(device).eval()
@@ -84,11 +86,14 @@ def infer(model: torch.nn.Module, image: torch.Tensor, input_size: int) -> torch
     ratio = input_size / max(height, width)
     resized_height = max(14, round(height * ratio / 14) * 14)
     resized_width = max(14, round(width * ratio / 14) * 14)
-    image = F.interpolate(image, (resized_height, resized_width), mode="bilinear", align_corners=False, antialias=True)
+    interpolation_kwargs = {"mode": "bilinear", "align_corners": False}
+    if image.device.type != "npu":
+        interpolation_kwargs["antialias"] = True
+    image = F.interpolate(image, (resized_height, resized_width), **interpolation_kwargs)
     mean = image.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
     std = image.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
     depth = model((image - mean) / std).unsqueeze(1)
-    return F.interpolate(depth, (height, width), mode="bilinear", align_corners=False, antialias=True).clamp_min(1e-4)
+    return F.interpolate(depth, (height, width), **interpolation_kwargs).clamp_min(1e-4)
 
 
 def save_depth(depth: torch.Tensor, path: Path) -> None:
@@ -106,7 +111,7 @@ def save_depth(depth: torch.Tensor, path: Path) -> None:
 def main() -> None:
     args = arguments()
     device = select_device(args.device)
-    model = load_model(args.source_dir, args.checkpoint, args.encoder, device)
+    model = load_model(args.source_dir, args.checkpoint, args.encoder, args.max_depth, device)
     processed = 0
     for split in args.splits:
         sequences = load_seq_data(args.data_path, split)

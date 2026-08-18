@@ -1,21 +1,31 @@
 # Flash3D training dependencies for Huawei Ascend 910B on Linux.
 #
-# Target framework profile (official Ascend compatibility matrix):
-#   CANN 9.0.0 + Python 3.10/3.11 + PyTorch 2.7.1 + torch_npu 2.7.1.post4
+# Target framework profile for this project:
+#   Linux + Ascend 910B + Python 3.10 + PyTorch 2.7.1 + torch_npu 2.7.1.post4
+#
+# CANN and torch_npu are a matched pair, not independently selectable pip
+# packages. Before installing this file, choose the exact torch_npu wheel for
+# the installed CANN release and CPU architecture from Ascend's official
+# compatibility table.  The torch_npu project documents Python 3.10 support
+# for PyTorch 2.7.1, but its CANN-to-wheel mapping changes by release.
 #
 # Prerequisites NOT installable by pip:
-#   1. Install the Ascend 910B driver, firmware and CANN toolkit 9.0.0.
+#   1. Install the Ascend 910B driver, firmware and a CANN toolkit supported
+#      by the selected torch_npu wheel.
 #   2. In every shell, initialise CANN, for example:
 #        source /usr/local/Ascend/ascend-toolkit/set_env.sh
 #      (the installed CANN path may differ).
-#   3. Install the torch_npu wheel matching BOTH your CANN version and CPU
-#      architecture (x86_64/aarch64) from the official Ascend release site.
+#   3. Install the torch_npu wheel matching BOTH CANN and CPU architecture
+#      (x86_64/aarch64) from the official Ascend release site.
+#   4. Install a matching *CPU* PyTorch wheel before this file. Do not install
+#      a CUDA PyTorch build on the NPU host.
 #
 # Do not install requirements.txt together with this file: it contains CUDA
 # extensions (xformers and diff-gaussian-rasterization) that cannot run on NPU.
 
-# PyTorch core.  Use the official Ascend wheel source for torch_npu if your
-# mirror does not expose this package directly.
+# PyTorch core. ``torch==2.7.1+cpu`` also satisfies this pin; use the official
+# Ascend/CPU wheel source rather than a CUDA wheel.  torch_npu may need to be
+# installed separately from the downloaded wheel when it is absent from pip.
 torch==2.7.1
 torchvision==0.22.1
 torch_npu==2.7.1.post4
@@ -54,5 +64,52 @@ pytubefix
 # neptune
 
 # Explicitly excluded: xformers, triton, diff-gaussian-rasterization.
-# Flash3D's CUDA rasterizer must be replaced by an Ascend-native differentiable
-# Gaussian rasterizer before NPU training with photometric render loss is run.
+# NPU training/inference uses models/decoder/npu_differentiable_renderer.py,
+# the standard-PyTorch tile Gaussian renderer included in this repository.
+
+# ---------------------------------------------------------------------------
+# NON-PIP MODELS AND DATA: download/place these before running NPU scripts.
+# They are comments because a requirements file must never silently download
+# multi-GB research data or gated/licensed assets during ``pip install``.
+# ---------------------------------------------------------------------------
+#
+# [REQUIRED: frozen lightweight depth teacher]
+#   Source repository:
+#     git clone https://github.com/DepthAnything/Depth-Anything-V2.git \
+#       third_party/Depth-Anything-V2
+#   Checkpoint (Depth Anything V2 Metric Base, outdoor/VKITTI, 97.5M params):
+#     https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-VKITTI-Base/resolve/main/depth_anything_v2_metric_vkitti_vitb.pth?download=true
+#   Destination (exact filename expected by configs/model/depth/depth_anything_v2.yaml):
+#     weights/depth-anything-v2/depth_anything_v2_metric_vkitti_vitb.pth
+#   The adapter imports third_party/Depth-Anything-V2/metric_depth so the
+#   metric model's depth scale (max_depth=80) is preserved. For indoor-only
+#   data, replace this pair with the official Hypersim ViT-B checkpoint and
+#   override model.depth.checkpoint=... model.depth.max_depth=20.
+#
+# [REQUIRED: Flash3D pre-training data]
+#   RealEstate10K metadata + image frames + COLMAP/sparse-PCL cache, prepared
+#   under one root passed as --data-path. Expected layout includes:
+#     <root>/train.pickle.gz, <root>/test.pickle.gz
+#     <root>/train/<sequence>/<timestamp>.jpg
+#     <root>/test/<sequence>/<timestamp>.jpg
+#     <root>/pcl.train.tar, <root>/pcl.test.tar
+#   Follow the repository README "Download training data" commands to obtain
+#   the licensed RE10K metadata/images and create/filter the COLMAP cache.
+#
+# [OPTIONAL: removes frozen ViT-B forward work during pre-training]
+#   Generate Depth Anything depth cache with:
+#     python scripts/precompute_depth_anything_re10k.py \
+#       --data-path <RE10K_ROOT> --output <DEPTH_CACHE_ROOT> --device npu
+#   Then pass --depth-path <DEPTH_CACHE_ROOT> to scripts/pretrain_npu.py.
+#
+# [OPTIONAL: ImageNet initialization for Flash3D's trainable ResNet-50]
+#   torchvision downloads ResNet50_Weights.IMAGENET1K_V2 automatically on the
+#   first run. For an offline host, pre-populate TORCH_HOME/hub/checkpoints
+#   from the URL exposed by torchvision's ResNet50_Weights.IMAGENET1K_V2.
+#   Set --override model.backbone.weights_init=scratch to skip it instead.
+#
+# [NOT downloaded before first training]
+#   Flash3D NPU checkpoint: outputs/<experiment>/checkpoints/model_*.pth
+#   This is produced by scripts/pretrain_npu.py and is the --checkpoint input
+#   for scripts/infer_npu.py. Existing UniDepth Flash3D checkpoints are not
+#   compatible with the Depth Anything V2 replacement.

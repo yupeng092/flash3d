@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-card Ascend 910B Flash3D pre-training launcher.
+# NPU single-image inference launcher. All infer_npu.py arguments are passed on.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,8 +12,7 @@ if [[ ! -f "${CANN_ENV}" ]]; then
 fi
 source "${CANN_ENV}"
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_ID}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 cd "${PROJECT_ROOT}"
 python scripts/check_npu_env.py
-exec python scripts/pretrain_npu.py "$@"
+exec python scripts/infer_npu.py "$@"

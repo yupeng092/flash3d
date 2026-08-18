@@ -24,6 +24,12 @@ train:
 
 model:
   name: depth_anything_v2
+  # Depth Anything V2 Base is a frozen geometric teacher. Only Flash3D's
+  # ResNet feature encoder and Gaussian/depth decoder heads receive updates.
+  depth:
+    encoder: vitb
+    freeze: true
+    intrinsics_source: provided
   gauss_novel_frames: [-1, 1, 2]
   renderer_w_pose: true
   renderer_backend: npu_torch
@@ -40,3 +46,9 @@ model:
   xyz_scale: 0.2
   max_depth: 20
   depth_cond: true
+
+loss:
+  # LPIPS is optional for later fine-tuning. Disable it for first-stage 910B
+  # pre-training so the VGG metric network is not instantiated/downloaded.
+  lpips:
+    weight: 0.0

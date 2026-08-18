@@ -178,3 +178,7 @@ third_party/
 *.pt
 *.bin
 *.safetensors
+
+# Local virtual environments and tool caches
+.venv-cpu/
+.deep-copilot/

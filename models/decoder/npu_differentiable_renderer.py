@@ -23,6 +23,22 @@ import torch.nn.functional as F
 
 _SH_C0 = 0.28209479177387814
 _SH_C1 = 0.4886025119029199
+_SH_C2 = (
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396,
+)
+_SH_C3 = (
+    -0.5900435899266435,
+    2.890611442640554,
+    -0.4570457994644658,
+    0.3731763325901154,
+    -0.4570457994644658,
+    1.445305721320277,
+    -0.5900435899266435,
+)
 
 
 def _model_option(cfg: Any, name: str, default: Any) -> Any:
@@ -53,7 +69,7 @@ def _quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
 def _evaluate_colour(
     pc: dict[str, torch.Tensor], camera_center: torch.Tensor, max_sh_degree: int
 ) -> torch.Tensor:
-    """Evaluate DC/degree-1 SH colours in the same convention as 3DGS."""
+    """Evaluate real SH colours in the same convention as 3DGS/Flash3D."""
     if "features_dc" not in pc:
         raise KeyError("pc must contain features_dc")
     dc = pc["features_dc"].float()
@@ -65,8 +81,6 @@ def _evaluate_colour(
     colour = _SH_C0 * dc
     if max_sh_degree > 0 and "features_rest" in pc:
         rest = pc["features_rest"].float()
-        # Flash3D's default is degree 1 (three non-DC terms).  Higher-degree
-        # terms are deliberately ignored in this pre-training renderer.
         if rest.ndim == 3 and rest.shape[1] >= 3:
             direction = F.normalize(
                 pc["xyz"].float() - camera_center.float().reshape(1, 3),
@@ -80,6 +94,26 @@ def _evaluate_colour(
                 + _SH_C1 * z[:, None] * rest[:, 1]
                 - _SH_C1 * x[:, None] * rest[:, 2]
             )
+            if max_sh_degree >= 2 and rest.shape[1] >= 8:
+                xx, yy, zz = x.square(), y.square(), z.square()
+                xy, yz, xz = x * y, y * z, x * z
+                colour = colour + (
+                    _SH_C2[0] * xy[:, None] * rest[:, 3]
+                    + _SH_C2[1] * yz[:, None] * rest[:, 4]
+                    + _SH_C2[2] * (2.0 * zz - xx - yy)[:, None] * rest[:, 5]
+                    + _SH_C2[3] * xz[:, None] * rest[:, 6]
+                    + _SH_C2[4] * (xx - yy)[:, None] * rest[:, 7]
+                )
+            if max_sh_degree >= 3 and rest.shape[1] >= 15:
+                colour = colour + (
+                    _SH_C3[0] * (y * (3.0 * xx - yy))[:, None] * rest[:, 8]
+                    + _SH_C3[1] * (x * y * z)[:, None] * rest[:, 9]
+                    + _SH_C3[2] * (y * (4.0 * zz - xx - yy))[:, None] * rest[:, 10]
+                    + _SH_C3[3] * (z * (2.0 * zz - 3.0 * xx - 3.0 * yy))[:, None] * rest[:, 11]
+                    + _SH_C3[4] * (x * (4.0 * zz - xx - yy))[:, None] * rest[:, 12]
+                    + _SH_C3[5] * (z * (xx - yy))[:, None] * rest[:, 13]
+                    + _SH_C3[6] * (x * (xx - 3.0 * yy))[:, None] * rest[:, 14]
+                )
     # This matches 3DGS's SH-to-RGB offset.  Do not clamp the upper end during
     # training: saturation there would eliminate useful colour gradients.
     return (colour + 0.5).clamp_min(0.0)
@@ -95,6 +129,7 @@ def _project_gaussians(
     max_sh_degree: int,
     scale_modifier: float,
     override_color: torch.Tensor | None,
+    principal_point: tuple[float, float] | None = None,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Project 3D Gaussians and return visible, depth-sorted candidates."""
     height, width = image_size
@@ -116,8 +151,12 @@ def _project_gaussians(
     focal_x = width / (2.0 * math.tan(fov_x * 0.5))
     focal_y = height / (2.0 * math.tan(fov_y * 0.5))
     inverse_z = z.clamp_min(near).reciprocal()
-    u = focal_x * x * inverse_z + (width - 1.0) * 0.5
-    v = focal_y * y * inverse_z + (height - 1.0) * 0.5
+    if principal_point is None:
+        principal_x, principal_y = (width - 1.0) * 0.5, (height - 1.0) * 0.5
+    else:
+        principal_x, principal_y = principal_point
+    u = focal_x * x * inverse_z + principal_x
+    v = focal_y * y * inverse_z + principal_y
 
     scales = pc["scaling"].float().clamp_min(1e-7) * scale_modifier
     rotation = _quaternion_to_matrix(pc["rotation"])
@@ -236,8 +275,8 @@ def _rasterize_tiles(
     tile_span = int(_model_option(cfg, "npu_renderer_tile_span", 5))
     max_per_tile = int(_model_option(cfg, "npu_renderer_max_gaussians_per_tile", 128))
     sigma_cutoff = float(_model_option(cfg, "npu_renderer_sigma_cutoff", 3.0))
-    if tile_size < 1 or max_per_tile < 1:
-        raise ValueError("NPU renderer tile_size and max_gaussians_per_tile must be positive")
+    if tile_size < 1 or max_per_tile < 0:
+        raise ValueError("NPU renderer tile_size must be positive and max_gaussians_per_tile non-negative")
     device = projected["u"].device
     background = background.to(device=device, dtype=torch.float32).reshape(3, 1, 1)
     rgb = background.expand(3, height, width).clone()
@@ -250,7 +289,7 @@ def _rasterize_tiles(
         if count == 0:
             continue
         selected = sorted_indices[start : start + count]
-        if selected.numel() > max_per_tile:
+        if max_per_tile > 0 and selected.numel() > max_per_tile:
             keep = torch.topk(projected["opacity"][selected], k=max_per_tile, sorted=False).indices
             selected = selected[keep]
         selected = selected[torch.argsort(projected["z"][selected])]
@@ -302,17 +341,20 @@ def render_predicted_torch(
     max_sh_degree: int,
     scaling_modifier: float = 1.0,
     override_color: torch.Tensor | None = None,
+    principal_point: tuple[float, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Render one Flash3D sample using differentiable standard Torch/NPU ops.
 
     ``full_proj_transform`` and ``proj_mtrx`` are retained for drop-in API
     compatibility with ``render_predicted``.  Projection is expressed from the
     view matrix and FOV to keep it portable across torch_npu releases.
+    ``principal_point`` is optional for backward compatibility; supplying it
+    preserves a calibrated non-central camera matrix during CPU inference.
     """
     del full_proj_transform, proj_mtrx
     projected, radii, visibility = _project_gaussians(
         cfg, pc, world_view_transform, camera_center, fov, img_size,
-        max_sh_degree, scaling_modifier, override_color,
+        max_sh_degree, scaling_modifier, override_color, principal_point,
     )
     rendered_image, rendered_depth, rendered_alpha = _rasterize_tiles(
         cfg, projected, img_size[0], img_size[1], bg_color

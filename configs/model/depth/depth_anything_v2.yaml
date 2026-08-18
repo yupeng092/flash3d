@@ -6,6 +6,11 @@ name: depth_anything_v2
 encoder: vitb
 source_dir: third_party/Depth-Anything-V2
 checkpoint: weights/depth-anything-v2/depth_anything_v2_metric_vkitti_vitb.pth
+# Load the official metric_depth implementation, not DA-V2's relative-depth
+# root module. The VKITTI model is an outdoor 80 m checkpoint; choose the
+# Hypersim 20 m file and set max_depth=20 for an indoor-only training corpus.
+metric_depth: true
+max_depth: 80.0
 input_size: 518
 min_depth: 1.0e-4
 depth_normalizer: 20.0

@@ -53,7 +53,61 @@ pip install -r requirements.txt
 
 For the local UniDepth V1 source/weight layout used by this repository (including an offline CPU fallback), see [docs/UNIDEPTH_SETUP.md](docs/UNIDEPTH_SETUP.md).
 
+For Ascend 910B setup, frozen Depth Anything V2 Base pre-training, and NPU
+single-image multi-view inference, see [scripts/README_npu.md](scripts/README_npu.md).
+
 For CPU rendering from exported `gaussians.pt`, use `render_cpu_multiview.py`.  It renders named multi-camera rigs (the default is centre/left/right/up/down) and writes the exact rig to `camera_rig.json`.
+
+### Native Flash3D CUDA renderer for multi-view output
+
+The multi-view command also exposes Flash3D's original CUDA
+`diff-gaussian-rasterization` path.  Unlike the portable CPU reference
+renderer, it uses the same projection matrix convention, `projmatrix_raw`, SH
+coefficients, Gaussian scales and rotations as
+`models/decoder/gauss_util.py`.  Use it on a CUDA machine with the project's
+standard environment installed:
+
+```sh
+python render_cpu_multiview.py \
+  --backend native \
+  --gaussians outputs/flash3d_repaired_source_check/gaussians.pt \
+  --rig cross5 --baseline 0.15 --vertical-baseline 0.10 \
+  --use-source-intrinsics --height 256 --width 384 \
+  --scale-modifier 0.55 \
+  --output outputs/flash3d_native_cross5
+```
+
+The default `--backend torch` is a pure-PyTorch, CPU-capable implementation of
+the same tile-binning, depth sorting and front-to-back compositing pipeline;
+it needs neither CUDA nor the extension. `--backend cpu` is retained as an
+alias for it. `--backend legacy` selects the earlier lightweight approximation
+only for A/B comparisons. The native backend is intentionally not an NPU/CPU
+fallback; it fails early with a clear message if CUDA or
+`diff_gaussian_rasterization` is unavailable. Options such as `--chunk-size`
+are specific to the legacy renderer and do not change native CUDA
+rasterization.
+
+`render_cpu_multiview.py` accepts Flash3D `gaussians.pt`, standard binary 3DGS `.ply` files (including log-scale/logit-opacity exports), and UniSHARP's `unisharp_gaussians` `.pt` export.  For cross-model comparisons, use the same camera rig with `--position-scale` set to the ratio of the model's scene depth scale to the reference scene depth scale.
+
+For a UniSHARP export, add `--use-source-intrinsics`: its calibrated camera matrix is embedded in the export and is automatically resized to the requested output resolution.  The CPU renderer also evaluates the `f_rest_*` coefficients of a standard 3DGS PLY up to degree 3, so specular/view-dependent colour is not mistakenly kept constant while the camera moves.  Flash3D exports fixed RGB rather than higher-order SH, so this latter correction cannot add view-dependent appearance to Flash3D.
+
+UniSHARP Gaussian colours are linear RGB.  Add `--linear-to-srgb` when writing ordinary PNGs, otherwise a standard image viewer interprets the linear values as sRGB and the result appears too dark.
+
+`benchmark_cpu.py` saves the camera matrix that UniDepth actually used in `gaussians.pt` metadata.  For a calibrated photograph (or a RE10K frame), provide the original-image pixel intrinsics with `--intrinsics FX FY CX CY`; the script resizes and pads the matrix exactly as the RE10K loader does.  The exported Gaussian file can then be rendered with `render_cpu_multiview.py --use-source-intrinsics`.
+
+## Optional Real-ESRGAN super-resolution
+
+To upscale rendered multi-view RGB images after CPU rendering, install the optional dependency and run:
+
+```powershell
+python -m pip install -r requirements-realesrgan.txt
+python superresolve_realesrgan.py `
+  --input outputs/cpu_multiview_physical_ten_test/rgb `
+  --output outputs/cpu_multiview_physical_ten_test/rgb_x2 `
+  --outscale 2 --tile 128
+```
+
+The script downloads the official `RealESRGAN_x4plus` checkpoint to `weights/realesrgan/` on first use. Use `--model-path` to supply an offline checkpoint, and lower `--tile` if CPU memory is limited.
 
 ## Download training data
 
@@ -119,5 +173,3 @@ You can modify the cluster information in ```configs/hydra/cluster```.
       year = {2024},
 }
 ```
-
-

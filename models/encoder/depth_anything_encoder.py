@@ -84,22 +84,26 @@ class DepthAnythingV2Extended(nn.Module):
         project_root = Path(__file__).resolve().parents[2]
         source_dir = project_root / Path(depth_cfg.source_dir)
         checkpoint = project_root / Path(depth_cfg.checkpoint)
-        if not source_dir.joinpath("depth_anything_v2", "dpt.py").is_file():
+        import_dir = source_dir / "metric_depth" if depth_cfg.get("metric_depth", False) else source_dir
+        if not import_dir.joinpath("depth_anything_v2", "dpt.py").is_file():
             raise FileNotFoundError(
-                f"Depth Anything V2 source is missing at {source_dir}. "
+                f"Depth Anything V2 source is missing at {import_dir}. "
                 "Clone https://github.com/DepthAnything/Depth-Anything-V2 there."
             )
         if not checkpoint.is_file():
             raise FileNotFoundError(
                 f"Depth Anything V2 checkpoint is missing: {checkpoint}"
             )
-        sys.path.insert(0, str(source_dir))
+        sys.path.insert(0, str(import_dir))
         try:
             from depth_anything_v2.dpt import DepthAnythingV2
         finally:
             sys.path.pop(0)
 
-        self.depth_model = DepthAnythingV2(encoder=encoder_name, **DEPTH_ANYTHING_CONFIGS[encoder_name])
+        depth_kwargs = {"encoder": encoder_name, **DEPTH_ANYTHING_CONFIGS[encoder_name]}
+        if depth_cfg.get("metric_depth", False):
+            depth_kwargs["max_depth"] = float(depth_cfg.max_depth)
+        self.depth_model = DepthAnythingV2(**depth_kwargs)
         checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if "model" in checkpoint_data:
             checkpoint_data = checkpoint_data["model"]
@@ -144,6 +148,20 @@ class DepthAnythingV2Extended(nn.Module):
     def get_parameter_groups(self):
         return self.parameters_to_train
 
+    def train(self, mode: bool = True):
+        """Keep the frozen Depth Anything teacher deterministic in pre-training.
+
+        ``GaussianPredictor.set_train()`` calls ``train()`` on this whole
+        wrapper.  Merely setting ``requires_grad=False`` is insufficient:
+        calling the parent implementation would put dropout/stochastic-depth
+        layers in training mode again.  The Gaussian encoder/decoders continue
+        to train, while the frozen depth foundation model remains in eval mode.
+        """
+        super().train(mode)
+        if self.cfg.model.depth.freeze:
+            self.depth_model.eval()
+        return self
+
     def _infer_depth(self, image: torch.Tensor) -> torch.Tensor:
         """ImageNet normalization and aspect-ratio-preserving multiple-of-14 input."""
         height, width = image.shape[-2:]
@@ -151,15 +169,20 @@ class DepthAnythingV2Extended(nn.Module):
         scale = long_side / max(height, width)
         resized_h = max(14, round(height * scale / 14) * 14)
         resized_w = max(14, round(width * scale / 14) * 14)
-        resized = F.interpolate(image, (resized_h, resized_w), mode="bilinear", align_corners=False, antialias=True)
+        # CANN's bilinear interpolation does not expose PyTorch's optional
+        # antialias kernel on every 910B software release.  Omitting it on NPU
+        # keeps the frozen teacher fully on device rather than failing or
+        # silently falling back to host execution.
+        interpolation_kwargs = {"mode": "bilinear", "align_corners": False}
+        if image.device.type != "npu":
+            interpolation_kwargs["antialias"] = True
+        resized = F.interpolate(image, (resized_h, resized_w), **interpolation_kwargs)
         normalised = (resized - image.new_tensor([0.485, 0.456, 0.406])[None, :, None, None])
         normalised = normalised / image.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
         context = torch.enable_grad() if not self.cfg.model.depth.freeze else torch.no_grad()
         with context:
             depth = self.depth_model(normalised).unsqueeze(1)
-        return F.interpolate(depth, (height, width), mode="bilinear", align_corners=False, antialias=True).clamp_min(
-            self.cfg.model.depth.min_depth
-        )
+        return F.interpolate(depth, (height, width), **interpolation_kwargs).clamp_min(self.cfg.model.depth.min_depth)
 
     def _source_intrinsics(self, inputs: dict, image: torch.Tensor) -> torch.Tensor:
         use_provided = self.cfg.model.depth.intrinsics_source == "provided"
