@@ -1,0 +1,4 @@
+# Optional CUDA backend for render_cpu_multiview.py.
+# Install this in an environment with a CUDA-enabled PyTorch build:
+#   python -m pip install -r requirements-gsplat.txt
+gsplat>=1.5

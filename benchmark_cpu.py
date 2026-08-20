@@ -212,6 +212,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--views", type=int, default=9)
     parser.add_argument("--render-height", type=int, default=192)
     parser.add_argument("--render-width", type=int, default=288)
+    parser.add_argument(
+        "--inference-height", type=int, default=None,
+        help="Override the Flash3D input height before model construction; must be paired with --inference-width and divisible by 32",
+    )
+    parser.add_argument(
+        "--inference-width", type=int, default=None,
+        help="Override the Flash3D input width before model construction; must be paired with --inference-height and divisible by 32",
+    )
     parser.add_argument("--translation", type=float, default=0.12, help="Left/right translation in source-depth units")
     parser.add_argument("--yaw", type=float, default=8.0, help="Maximum yaw in degrees")
     parser.add_argument("--keep-ratio", type=float, default=0.35, help="Keep the highest-opacity fraction (0, 1]")
@@ -248,6 +256,18 @@ def main() -> None:
     torch.manual_seed(0)
     device = torch.device("cpu")
     cfg = load_cfg(args)
+    if (args.inference_height is None) != (args.inference_width is None):
+        raise ValueError("--inference-height and --inference-width must be supplied together")
+    if args.inference_height is not None:
+        if args.inference_height <= 0 or args.inference_width <= 0:
+            raise ValueError("inference dimensions must be positive")
+        if args.inference_height % 32 or args.inference_width % 32:
+            raise ValueError("inference dimensions must both be divisible by 32")
+        # The predictor is fully convolutional, but its back-projection grids
+        # are allocated during construction.  Override dimensions before the
+        # model is instantiated rather than resizing only the output render.
+        cfg.dataset.height = args.inference_height
+        cfg.dataset.width = args.inference_width
     args.output.mkdir(parents=True, exist_ok=True)
 
     model = GaussianPredictor(cfg).to(device)

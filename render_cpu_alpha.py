@@ -359,7 +359,10 @@ def evaluate_view_dependent_color(
     directions = torch.nn.functional.normalize(
         gaussians["xyz"] - camera_center[None], dim=-1, eps=1e-8)
     x, y, z = directions.unbind(dim=-1)
-    result = SH_C0 * ((gaussians["color"] - 0.5) / SH_C0)
+    # Start from the un-clipped DC coefficient.  Clipping is part of the
+    # final 3DGS/gsplat RGB activation; doing it earlier changes higher-order
+    # SH colours for saturated Gaussians.
+    result = SH_C0 * gaussians["features_dc"]
     degree = min(3, int(math.sqrt(coefficients.shape[1] + 1)) - 1)
     if degree >= 1:
         result = result + (

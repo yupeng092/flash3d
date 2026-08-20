@@ -33,10 +33,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 from render_cpu_alpha import (
     crop_and_downsample,
+    evaluate_view_dependent_color,
     linear_to_srgb,
     load_gaussians,
     normalise_depth,
     project_gaussians,
+    quaternion_to_rotation,
     rasterize,
     save_gray,
     save_rgb,
@@ -67,6 +69,28 @@ def _native_renderer_dependencies() -> tuple[object, object, object]:
     return GaussianRasterizationSettings, GaussianRasterizer, getProjectionMatrix
 
 
+def _gsplat_renderer_dependency() -> object:
+    """Load gsplat only for its CUDA backend, keeping CPU usage dependency-free."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "--backend gsplat requires a CUDA-enabled PyTorch build and GPU. "
+            "Use --backend torch on this machine."
+        )
+    try:
+        # Current gsplat releases export this at package level.  The fallback
+        # keeps the adapter usable with older package layouts.
+        from gsplat import rasterization
+    except ImportError:
+        try:
+            from gsplat.rendering import rasterization
+        except ImportError as exc:
+            raise RuntimeError(
+                "--backend gsplat requires the CUDA gsplat package. Install it "
+                "in the CUDA environment with: python -m pip install gsplat"
+            ) from exc
+    return rasterization
+
+
 def _native_sh_degree(gaussians: dict[str, torch.Tensor]) -> int:
     """Infer the supported real-SH degree from canonical [N, K, 3] terms."""
     rest = gaussians.get("features_rest")
@@ -77,6 +101,79 @@ def _native_sh_degree(gaussians: dict[str, torch.Tensor]) -> int:
     if (degree + 1) ** 2 != coefficients:
         raise ValueError(f"Invalid SH coefficient count: {coefficients}")
     return degree
+
+
+@torch.inference_mode()
+def rasterize_gsplat(
+    gaussians: dict[str, torch.Tensor],
+    world_to_camera: torch.Tensor,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    background: torch.Tensor,
+    near: float,
+    far: float,
+    scale_modifier: float,
+    eps2d: float,
+    radius_clip: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Render a Flash3D Gaussian scene through gsplat's CUDA rasterizer.
+
+    gsplat uses conventional (non-transposed) world-to-camera matrices and
+    scalar-first ``wxyz`` quaternions, which is the same quaternion layout
+    exported by Flash3D.  In contrast, Flash3D's own CUDA extension receives
+    transposed matrices; do not transpose ``world_to_camera`` here.
+    """
+    rasterization = _gsplat_renderer_dependency()
+    device = torch.device("cuda")
+    means = gaussians["xyz"].to(device, non_blocking=True).contiguous()
+    quats = gaussians["rotation"].to(device, non_blocking=True).contiguous()
+    scales = (gaussians["scaling"] * scale_modifier).to(device, non_blocking=True).contiguous()
+    opacities = gaussians["opacity"].to(device, non_blocking=True).reshape(-1).contiguous()
+    features_dc = gaussians["features_dc"].to(device, non_blocking=True).reshape(-1, 1, 3).contiguous()
+    features_rest = gaussians.get("features_rest")
+    if features_rest is not None and features_rest.numel() > 0:
+        colors = torch.cat((features_dc, features_rest.to(device, non_blocking=True)), dim=1).contiguous()
+        sh_degree = _native_sh_degree(gaussians)
+    else:
+        # Degree-zero SH avoids an activation/convention mismatch with RGB
+        # colours while retaining exactly the Flash3D DC coefficients.
+        colors = features_dc
+        sh_degree = 0
+    intrinsic = torch.tensor(
+        ((fx, 0.0, cx), (0.0, fy, cy), (0.0, 0.0, 1.0)), dtype=torch.float32, device=device
+    )
+    render, alpha, metadata = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=world_to_camera.to(device, non_blocking=True).float().unsqueeze(0),
+        Ks=intrinsic.unsqueeze(0),
+        width=width,
+        height=height,
+        near_plane=near,
+        far_plane=far,
+        radius_clip=radius_clip,
+        eps2d=eps2d,
+        sh_degree=sh_degree,
+        packed=False,
+        tile_size=16,
+        backgrounds=background.to(device, non_blocking=True).float().unsqueeze(0),
+        render_mode="RGB+ED",
+        rasterize_mode="classic",
+    )
+    # gsplat returns [C, H, W, RGB + expected-depth] and [C, H, W, 1].
+    rgb = render[0, ..., :3].detach().float().cpu()
+    depth = render[0, ..., 3].detach().float().cpu()
+    alpha = alpha[0, ..., 0].detach().float().cpu()
+    radii = metadata.get("radii")
+    visible = int((radii[0] > 0).sum().item()) if radii is not None and radii.ndim == 2 else int(means.shape[0])
+    return rgb, alpha, depth, visible
 
 
 @torch.inference_mode()
@@ -145,6 +242,124 @@ def rasterize_torch_flash3d(
     depth = result["depth"].detach().float().cpu()
     alpha = result["alpha"].detach().float().cpu()
     return rgb, alpha, depth, int(result["visibility_filter"].sum().item())
+
+
+@torch.inference_mode()
+def rasterize_gsplat_cpu_reference(
+    gaussians: dict[str, torch.Tensor],
+    world_to_camera: torch.Tensor,
+    camera_center: torch.Tensor,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    background: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """CPU reference for gsplat's 3DGS ``classic`` rasterization path.
+
+    This follows the public gsplat reference equations: conventional
+    world-to-camera transform, clamped Jacobian for perspective covariance,
+    ``eps2d`` diagonal regularization, 3.33-sigma axis-aligned tile bounds,
+    pixel-centre Gaussian evaluation, and front-to-back alpha compositing.
+    It intentionally trades CUDA throughput for inspectable CPU semantics.
+    """
+    if args.tile_size != 16:
+        raise ValueError("gsplat-compatible CPU reference requires --tile-size 16")
+    xyz = gaussians["xyz"].float()
+    rotation = world_to_camera[:3, :3].float()
+    translation = world_to_camera[:3, 3].float()
+    camera_xyz = xyz @ rotation.T + translation
+    x, y, z = camera_xyz.unbind(dim=-1)
+
+    # Matches gsplat.cuda._torch_impl._persp_proj: the mean uses the ordinary
+    # perspective projection while the Jacobian is bounded near the FOV edge.
+    inverse_z = z.clamp_min(args.near).reciprocal()
+    tan_fov_x, tan_fov_y = 0.5 * width / fx, 0.5 * height / fy
+    x_for_jacobian = z * torch.clamp(
+        x * inverse_z,
+        min=-(cx / fx + 0.3 * tan_fov_x),
+        max=((width - cx) / fx + 0.3 * tan_fov_x),
+    )
+    y_for_jacobian = z * torch.clamp(
+        y * inverse_z,
+        min=-(cy / fy + 0.3 * tan_fov_y),
+        max=((height - cy) / fy + 0.3 * tan_fov_y),
+    )
+    means2d = torch.stack((fx * x * inverse_z + cx, fy * y * inverse_z + cy), dim=-1)
+
+    # gsplat builds the 3D covariance directly from the supplied scales.  Do
+    # not pre-clamp here: its only opacity cap is applied per pixel below.
+    scales = gaussians["scaling"].float() * args.scale_modifier
+    basis = quaternion_to_rotation(gaussians["rotation"].float()) * scales[:, None, :]
+    covariance_world = basis @ basis.transpose(1, 2)
+    covariance_camera = rotation[None] @ covariance_world @ rotation.T[None]
+    jacobian = torch.zeros((len(xyz), 2, 3), dtype=torch.float32)
+    jacobian[:, 0, 0] = fx * inverse_z
+    jacobian[:, 0, 2] = -fx * x_for_jacobian * inverse_z.square()
+    jacobian[:, 1, 1] = fy * inverse_z
+    jacobian[:, 1, 2] = -fy * y_for_jacobian * inverse_z.square()
+    covariance_2d = jacobian @ covariance_camera @ jacobian.transpose(1, 2)
+    covariance_2d[:, 0, 0] += args.gsplat_eps2d
+    covariance_2d[:, 1, 1] += args.gsplat_eps2d
+    a, b, c = covariance_2d[:, 0, 0], covariance_2d[:, 0, 1], covariance_2d[:, 1, 1]
+    determinant = (a * c - b * b).clamp_min(1e-10)
+    conics = torch.stack((c / determinant, -b / determinant, a / determinant), dim=-1)
+    radii = torch.stack((torch.ceil(3.33 * a.clamp_min(0).sqrt()), torch.ceil(3.33 * c.clamp_min(0).sqrt())), dim=-1)
+    visible = (
+        (z > args.near) & (z < args.far) & torch.isfinite(conics).all(dim=-1)
+        & (means2d[:, 0] + radii[:, 0] > 0) & (means2d[:, 0] - radii[:, 0] < width)
+        & (means2d[:, 1] + radii[:, 1] > 0) & (means2d[:, 1] - radii[:, 1] < height)
+        & (radii.amax(dim=-1) > args.gsplat_radius_clip)
+    )
+    opacity = gaussians["opacity"].float()
+    colours = evaluate_view_dependent_color(gaussians, camera_center).float()
+    rgb = torch.empty((height, width, 3), dtype=torch.float32)
+    alpha_image = torch.empty((height, width), dtype=torch.float32)
+    depth_image = torch.empty((height, width), dtype=torch.float32)
+    tile_size = args.tile_size
+    for y0 in range(0, height, tile_size):
+        y1 = min(y0 + tile_size, height)
+        for x0 in range(0, width, tile_size):
+            x1 = min(x0 + tile_size, width)
+            selected = torch.where(
+                visible
+                & (means2d[:, 0] + radii[:, 0] > x0)
+                & (means2d[:, 0] - radii[:, 0] < x1)
+                & (means2d[:, 1] + radii[:, 1] > y0)
+                & (means2d[:, 1] - radii[:, 1] < y1)
+            )[0]
+            if selected.numel() == 0:
+                rgb[y0:y1, x0:x1] = background
+                alpha_image[y0:y1, x0:x1] = 0
+                depth_image[y0:y1, x0:x1] = 0
+                continue
+            # gsplat's intersection key orders each tile by float32 camera z.
+            selected = selected[torch.argsort(z[selected].float(), stable=True)]
+            yy, xx = torch.meshgrid(
+                torch.arange(y0, y1, dtype=torch.float32) + 0.5,
+                torch.arange(x0, x1, dtype=torch.float32) + 0.5,
+                indexing="ij",
+            )
+            dx, dy = xx.reshape(1, -1) - means2d[selected, 0, None], yy.reshape(1, -1) - means2d[selected, 1, None]
+            conic = conics[selected]
+            sigma = 0.5 * (conic[:, 0, None] * dx.square() + conic[:, 2, None] * dy.square()) + conic[:, 1, None] * dx * dy
+            alpha = (opacity[selected, None] * torch.exp(-sigma)).clamp(max=0.999)
+            transmittance = torch.cumprod(
+                torch.cat((torch.ones_like(alpha[:1]), 1.0 - alpha[:-1]), dim=0), dim=0
+            )
+            weights = alpha * transmittance
+            final_transmittance = (1.0 - alpha).prod(dim=0)
+            tile_alpha = 1.0 - final_transmittance
+            tile_rgb = weights.T @ colours[selected] + final_transmittance[:, None] * background[None]
+            accumulated_depth = (weights * z[selected, None]).sum(dim=0)
+            tile_depth = torch.where(tile_alpha > 1e-6, accumulated_depth / tile_alpha, torch.zeros_like(tile_alpha))
+            rgb[y0:y1, x0:x1] = tile_rgb.reshape(y1 - y0, x1 - x0, 3)
+            alpha_image[y0:y1, x0:x1] = tile_alpha.reshape(y1 - y0, x1 - x0)
+            depth_image[y0:y1, x0:x1] = tile_depth.reshape(y1 - y0, x1 - x0)
+    return rgb, alpha_image, depth_image, int(visible.sum().item())
 
 
 @torch.inference_mode()
@@ -242,11 +457,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussians", type=Path, required=True, help="gaussians.pt exported by benchmark_cpu.py")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--backend", choices=("torch", "cpu", "legacy", "native"), default="torch",
+        "--backend", choices=("torch", "cpu", "flash3d_torch", "legacy", "native", "gsplat"), default="torch",
         help=(
-            "torch/default: Flash3D portable PyTorch renderer on CPU; "
-            "cpu is an alias for torch; legacy is the earlier lightweight "
-            "CPU approximation; native uses CUDA diff-gaussian-rasterization"
+            "torch/default and cpu: gsplat-classic CPU reference; "
+            "flash3d_torch: prior Flash3D portable PyTorch renderer; legacy is the earlier lightweight "
+            "CPU approximation; native uses Flash3D CUDA "
+            "diff-gaussian-rasterization; gsplat uses gsplat CUDA"
         ),
     )
     parser.add_argument("--rig", choices=("cross5", "arc5", "grid9"), default="cross5")
@@ -278,11 +494,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-cutoff", type=float, default=2.5)
     parser.add_argument("--min-variance", type=float, default=0.2)
     parser.add_argument("--max-radius", type=float, default=96.0)
+    parser.add_argument(
+        "--gsplat-eps2d", type=float, default=0.3,
+        help="gsplat only: projected-covariance regularizer in pixel-squared units",
+    )
+    parser.add_argument(
+        "--gsplat-radius-clip", type=float, default=0.0,
+        help="gsplat-compatible CPU/CUDA backends: skip splats whose projected radius is at or below this value",
+    )
     parser.add_argument("--near", type=float, default=0.01)
     parser.add_argument("--far", type=float, default=1000.0)
     parser.add_argument("--tile-size", type=int, default=16)
     parser.add_argument("--chunk-size", type=int, default=256)
     parser.add_argument("--background", type=float, nargs=3, default=(0.5, 0.5, 0.5))
+    parser.add_argument(
+        "--prune-source-depth-outliers", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "Before novel-view rendering, remove Gaussians that project behind a nearer "
+            "source-view surface. This reduces floating/occluded-layer speckles."
+        ),
+    )
+    parser.add_argument(
+        "--source-prune-grid-scale", type=float, default=2.0,
+        help="Depth-pruning grid resolution relative to --width/--height",
+    )
+    parser.add_argument(
+        "--source-prune-relative-tolerance", type=float, default=0.06,
+        help="Keep source-view points within this relative depth distance of the front layer",
+    )
+    parser.add_argument(
+        "--source-prune-absolute-tolerance", type=float, default=0.08,
+        help="Keep source-view points within this absolute depth distance of the front layer",
+    )
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--save-gaussians", action=argparse.BooleanOptionalAction, default=True, help="Save the filtered Gaussian point cloud as PT and coloured PLY")
     parser.add_argument("--contact-sheet-columns", type=int, default=5, help="Number of columns in comparison_grid.png")
@@ -446,15 +689,15 @@ def source_intrinsics_at_output_resolution(
     intrinsics = camera.get("intrinsics") if isinstance(camera, dict) else None
     if intrinsics is None:
         return None
-    if isinstance(intrinsics, torch.Tensor):
-        matrix = intrinsics.detach().cpu().float()
-        if matrix.numel() >= 9 and tuple(matrix.shape[-2:]) == (3, 3):
-            matrix = matrix.reshape(-1, 3, 3)[0]
-            values = [matrix[0, 0].item(), matrix[1, 1].item(), matrix[0, 2].item(), matrix[1, 2].item()]
-        else:
-            values = matrix.reshape(-1).tolist()
+    # Benchmark exports JSON, so a 3x3 matrix is commonly a nested Python
+    # list rather than a Tensor.  Canonicalise both forms before extracting
+    # fx, fy, cx and cy.
+    matrix = torch.as_tensor(intrinsics, dtype=torch.float32).detach().cpu()
+    if matrix.numel() >= 9 and tuple(matrix.shape[-2:]) == (3, 3):
+        matrix = matrix.reshape(-1, 3, 3)[0]
+        values = [matrix[0, 0].item(), matrix[1, 1].item(), matrix[0, 2].item(), matrix[1, 2].item()]
     else:
-        values = list(intrinsics)
+        values = matrix.reshape(-1).tolist()
     if len(values) < 4:
         return None
     input_h, input_w = metadata.get("input_size_hw", (height, width))
@@ -465,19 +708,122 @@ def source_intrinsics_at_output_resolution(
     return fx * sx, fy * sy, cx * sx, cy * sy
 
 
+@torch.inference_mode()
+def prune_source_depth_outliers(
+    gaussians: dict[str, torch.Tensor],
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    near: float,
+    grid_scale: float,
+    relative_tolerance: float,
+    absolute_tolerance: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, int | float]]:
+    """Cull points hidden behind the nearest source-view surface per grid cell.
+
+    A single-image Gaussian prediction frequently contains several candidate
+    depth layers along a source camera ray.  The layer behind the visible
+    surface is useful neither for reproducing the source image nor for stable
+    small-baseline novel views; when it leaks around an occlusion edge it
+    appears as a dark floating speckle.  This conservative filter retains the
+    front layer and any Gaussian close enough to it to cover a continuous
+    surface, accounting for its 3D scale.
+    """
+    if grid_scale <= 0:
+        raise ValueError("--source-prune-grid-scale must be > 0")
+    if relative_tolerance < 0 or absolute_tolerance < 0:
+        raise ValueError("source depth-pruning tolerances must be >= 0")
+
+    grid_width = max(1, round(width * grid_scale))
+    grid_height = max(1, round(height * grid_scale))
+    xyz = gaussians["xyz"]
+    z = xyz[:, 2]
+    # Resample camera coordinates using pixel-centre convention.
+    u = (fx * xyz[:, 0] / z.clamp_min(near) + cx + 0.5) * grid_scale - 0.5
+    v = (fy * xyz[:, 1] / z.clamp_min(near) + cy + 0.5) * grid_scale - 0.5
+    u_int, v_int = torch.floor(u).long(), torch.floor(v).long()
+    inside = (
+        (z > near)
+        & torch.isfinite(u)
+        & torch.isfinite(v)
+        & (u_int >= 0)
+        & (u_int < grid_width)
+        & (v_int >= 0)
+        & (v_int < grid_height)
+    )
+    cells = v_int[inside] * grid_width + u_int[inside]
+    front_depth = torch.full((grid_width * grid_height,), float("inf"), dtype=torch.float32)
+    front_depth.scatter_reduce_(0, cells, z[inside].float(), reduce="amin", include_self=True)
+    reference_depth = torch.full_like(z, float("inf"))
+    reference_depth[inside] = front_depth[cells]
+    scale_slack = 2.0 * gaussians["scaling"].abs().amax(dim=-1)
+    tolerated_depth = reference_depth * (1.0 + relative_tolerance) + absolute_tolerance + scale_slack
+    occluded = inside & (z > tolerated_depth)
+    keep = ~occluded
+    filtered = {key: value[keep].contiguous() for key, value in gaussians.items()}
+    return filtered, {
+        "grid_width": grid_width,
+        "grid_height": grid_height,
+        "input_gaussians": int(len(z)),
+        "projected_gaussians": int(inside.sum().item()),
+        "removed_occluded_gaussians": int(occluded.sum().item()),
+        "kept_gaussians": int(keep.sum().item()),
+        "relative_tolerance": relative_tolerance,
+        "absolute_tolerance": absolute_tolerance,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if not 0 < args.keep_ratio <= 1:
         raise ValueError("--keep-ratio must be in (0, 1]")
     if args.supersample < 1:
         raise ValueError("--supersample must be >= 1")
+    if args.gsplat_eps2d < 0:
+        raise ValueError("--gsplat-eps2d must be >= 0")
+    if args.gsplat_radius_clip < 0:
+        raise ValueError("--gsplat-radius-clip must be >= 0")
     if args.backend == "native":
         # Fail before creating partial output directories or loading a large
         # point cloud when this machine is intentionally CPU-only.
         _native_renderer_dependencies()
+    elif args.backend == "gsplat":
+        _gsplat_renderer_dependency()
     torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     gaussians, metadata = load_gaussians(args.gaussians, args.keep_ratio, args.min_opacity, args.crop_padding)
+    source_intrinsics = source_intrinsics_at_output_resolution(metadata, args.height, args.width)
+    if args.use_source_intrinsics and source_intrinsics is not None:
+        output_fx, output_fy, output_cx, output_cy = source_intrinsics
+        intrinsics_source = "embedded_source_camera"
+    else:
+        output_fx, output_fy = args.fx, args.fy
+        output_cx = (args.width - 1) * 0.5 if args.cx is None else args.cx
+        output_cy = (args.height - 1) * 0.5 if args.cy is None else args.cy
+        intrinsics_source = "cli" if source_intrinsics is None else "cli_override"
+    depth_pruning = None
+    if args.prune_source_depth_outliers:
+        gaussians, depth_pruning = prune_source_depth_outliers(
+            gaussians,
+            output_fx,
+            output_fy,
+            output_cx,
+            output_cy,
+            args.width,
+            args.height,
+            args.near,
+            args.source_prune_grid_scale,
+            args.source_prune_relative_tolerance,
+            args.source_prune_absolute_tolerance,
+        )
+        print(
+            "source-depth pruning: "
+            f"removed {depth_pruning['removed_occluded_gaussians']:,} / "
+            f"{depth_pruning['input_gaussians']:,} Gaussians"
+        )
     cameras = read_cameras(args)
     if args.position_scale <= 0:
         raise ValueError("--position-scale must be > 0")
@@ -492,15 +838,6 @@ def main() -> None:
     for directory in (rgb_dir, alpha_dir, depth_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    source_intrinsics = source_intrinsics_at_output_resolution(metadata, args.height, args.width)
-    if args.use_source_intrinsics and source_intrinsics is not None:
-        output_fx, output_fy, output_cx, output_cy = source_intrinsics
-        intrinsics_source = "embedded_source_camera"
-    else:
-        output_fx, output_fy = args.fx, args.fy
-        output_cx = (args.width - 1) * 0.5 if args.cx is None else args.cx
-        output_cy = (args.height - 1) * 0.5 if args.cy is None else args.cy
-        intrinsics_source = "cli" if source_intrinsics is None else "cli_override"
     render_height, render_width = args.height * args.supersample, args.width * args.supersample
     fx, fy = output_fx * args.supersample, output_fy * args.supersample
     cx = (output_cx + 0.5) * args.supersample - 0.5
@@ -510,6 +847,8 @@ def main() -> None:
     rgb_entries = []
 
     for index, camera in enumerate(cameras):
+        if args.backend in {"native", "gsplat"}:
+            torch.cuda.synchronize()
         start = time.perf_counter()
         transform, target = camera_transform(camera, default_target)
         camera_center = torch.tensor(camera["position_xyz"], dtype=torch.float32)
@@ -519,7 +858,18 @@ def main() -> None:
                 render_width, render_height, background, args.near, args.far,
                 args.scale_modifier,
             )
+        elif args.backend == "gsplat":
+            rgb, alpha, depth, visible_gaussians = rasterize_gsplat(
+                gaussians, transform, fx, fy, cx, cy,
+                render_width, render_height, background, args.near, args.far,
+                args.scale_modifier, args.gsplat_eps2d, args.gsplat_radius_clip,
+            )
         elif args.backend in {"torch", "cpu"}:
+            rgb, alpha, depth, visible_gaussians = rasterize_gsplat_cpu_reference(
+                gaussians, transform, camera_center, fx, fy, cx, cy,
+                render_width, render_height, background, args,
+            )
+        elif args.backend == "flash3d_torch":
             rgb, alpha, depth, visible_gaussians = rasterize_torch_flash3d(
                 gaussians, transform, camera_center, fx, fy, cx, cy,
                 render_width, render_height, background, args,
@@ -535,6 +885,8 @@ def main() -> None:
                 args.tile_size, args.chunk_size, args.sigma_cutoff,
             )
             visible_gaussians = projected["z"].numel()
+        if args.backend in {"native", "gsplat"}:
+            torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         rgb = unsharp_mask(crop_and_downsample(rgb, args.height, args.width, args.supersample, args.crop_margin), args.sharpen)
         if args.linear_to_srgb:
@@ -553,14 +905,22 @@ def main() -> None:
     comparison_grid = save_contact_sheet(rgb_entries, args.output, args.contact_sheet_columns, args.contact_sheet_title, args.contact_sheet_title_size)
     point_cloud = save_gaussian_point_cloud(gaussians, args.output, args.gaussians) if args.save_gaussians else None
     report = {
-        "device": "cuda" if args.backend == "native" else "cpu",
+        "device": "cuda" if args.backend in {"native", "gsplat"} else "cpu",
         "renderer": (
             "Flash3D native diff-gaussian-rasterization CUDA backend"
             if args.backend == "native"
             else (
-                "Flash3D portable PyTorch tile renderer (CPU)"
-                if args.backend in {"torch", "cpu"}
-                else "Legacy PyTorch anisotropic 3D Gaussian + front-to-back alpha blending"
+                "gsplat CUDA 3D Gaussian rasterizer"
+                if args.backend == "gsplat"
+                else (
+                    "gsplat classic-semantics CPU reference renderer"
+                    if args.backend in {"torch", "cpu"}
+                    else (
+                        "Flash3D portable PyTorch tile renderer (CPU)"
+                        if args.backend == "flash3d_torch"
+                        else "Legacy PyTorch anisotropic 3D Gaussian + front-to-back alpha blending"
+                    )
+                )
             )
         ),
         "backend": "torch" if args.backend == "cpu" else args.backend,
@@ -571,6 +931,7 @@ def main() -> None:
         "preset_rig": None if args.camera_file else args.rig,
         "camera_file": None if args.camera_file is None else str(args.camera_file.resolve()),
         "position_scale": args.position_scale,
+        "source_depth_pruning": depth_pruning,
         "linear_to_srgb": args.linear_to_srgb,
         "default_look_at_xyz": default_target.tolist(),
         "comparison_grid": str(comparison_grid.resolve()),
